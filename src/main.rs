@@ -13,6 +13,7 @@ const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Debug, Parser)]
 enum Command {
+    ListIps,
     Once,
     Repeat { every: String },
 }
@@ -42,6 +43,12 @@ async fn main() -> std::process::ExitCode {
 
 async fn run(command: Command) -> miette::Result<()> {
     match command {
+        Command::ListIps => {
+            let ips = get_ips().await?;
+            for ip in ips {
+                println!("{ip}");
+            }
+        }
         Command::Once => {
             update_ips().await?;
         }
@@ -57,11 +64,7 @@ async fn run(command: Command) -> miette::Result<()> {
     Ok(())
 }
 
-async fn update_ips() -> miette::Result<()> {
-    let node_name = std::env::var("KUBE_NODE_NAME")
-        .into_diagnostic()
-        .wrap_err("$KUBE_NODE_NAME must be set")?;
-
+async fn get_ips() -> miette::Result<HashSet<std::net::IpAddr>> {
     let global_ips = tokio::task::spawn_blocking(|| {
         let mut global_ips = HashSet::new();
 
@@ -93,6 +96,16 @@ async fn update_ips() -> miette::Result<()> {
 
         Ok::<_, miette::Error>(global_ips)
     }).await.into_diagnostic()??;
+
+    Ok(global_ips)
+}
+
+async fn update_ips() -> miette::Result<()> {
+    let node_name = std::env::var("KUBE_NODE_NAME")
+        .into_diagnostic()
+        .wrap_err("$KUBE_NODE_NAME must be set")?;
+
+    let global_ips = get_ips().await?;
     let global_ips = global_ips.join_with(",").to_string();
 
     let kube = kube::Client::try_default()
