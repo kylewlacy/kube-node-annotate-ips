@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use clap::Parser;
 use joinery::Joinable as _;
 use miette::{Context as _, IntoDiagnostic as _};
 use network_interface::NetworkInterfaceConfig as _;
@@ -10,11 +11,19 @@ const MAX_RETRIES: u32 = 10;
 
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 
+#[derive(Debug, Parser)]
+enum Command {
+    Once,
+    Repeat { every: String },
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    let command = Command::parse();
+
     tracing_subscriber::fmt().json().init();
 
-    match run().await {
+    match run(command).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             let causes = error
@@ -28,7 +37,24 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
-async fn run() -> miette::Result<()> {
+async fn run(command: Command) -> miette::Result<()> {
+    match command {
+        Command::Once => {
+            update_ips().await?;
+        }
+        Command::Repeat { every } => {
+            let every = humantime::parse_duration(&every)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("invalid value for repeat: {every:?}"))?;
+
+            update_ips_repeatedly(every).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn update_ips() -> miette::Result<()> {
     let node_name = std::env::var("KUBE_NODE_NAME")
         .into_diagnostic()
         .wrap_err("$KUBE_NODE_NAME must be set")?;
@@ -114,6 +140,27 @@ async fn run() -> miette::Result<()> {
 
                 tracing::warn!("request failed, retrying: {error:?}");
                 tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
+async fn update_ips_repeatedly(every: std::time::Duration) -> miette::Result<()> {
+    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+
+    loop {
+        tracing::info!("updating IPs");
+
+        update_ips().await?;
+
+        tokio::select! {
+            result = &mut ctrl_c => {
+                result.into_diagnostic().wrap_err("Ctrl-C handler failed")?;
+                tracing::info!("received Ctrl-C signal, shutting down...");
+                return Ok(());
+            }
+            _ = tokio::time::sleep(every) => {
+                // Ready to update IPs again
             }
         }
     }

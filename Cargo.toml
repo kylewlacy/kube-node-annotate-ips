@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4.5.53", features = ["derive"] }
+humantime = "2.3.0"
 ip_rfc = "0.1.0"
 joinery = "3.1.0"
 k8s-openapi = { version = "0.26.0", features = ["latest"] }
