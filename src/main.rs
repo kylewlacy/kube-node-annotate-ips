@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use clap::Parser;
 use joinery::{Joinable as _, JoinableIterator as _};
@@ -69,9 +69,9 @@ async fn run(command: Command) -> miette::Result<()> {
     Ok(())
 }
 
-async fn get_ips() -> miette::Result<HashSet<std::net::IpAddr>> {
+async fn get_ips() -> miette::Result<BTreeSet<std::net::IpAddr>> {
     let global_ips = tokio::task::spawn_blocking(|| {
-        let mut global_ips = HashSet::new();
+        let mut global_ips = BTreeSet::new();
 
         let ifaces = network_interface::NetworkInterface::show()
             .into_diagnostic()
