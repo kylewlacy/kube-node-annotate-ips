@@ -24,7 +24,8 @@ async fn main() -> std::process::ExitCode {
     let command = Command::parse();
 
     tracing_subscriber::fmt()
-        .json()
+        .compact()
+        .without_time()
         .with_env_filter(
             tracing_subscriber::EnvFilter::builder()
                 .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
