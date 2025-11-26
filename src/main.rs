@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use clap::Parser;
+use futures::StreamExt as _;
 use joinery::Joinable as _;
 use k8s_openapi::api::core::v1::Node;
 use miette::{Context as _, IntoDiagnostic as _};
@@ -16,7 +17,15 @@ const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 enum Command {
     ListIps,
     Once,
-    Repeat { every: String },
+    Repeat {
+        every: String,
+    },
+    PublishDns {
+        #[arg(long = "domain", num_args(1..))]
+        domains: Vec<String>,
+        #[arg(long = "domain")]
+        node_label_selector: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -64,6 +73,12 @@ async fn run(command: Command) -> miette::Result<()> {
                 .wrap_err_with(|| format!("invalid value for repeat: {every:?}"))?;
 
             update_nodes_repeatedly(every).await?;
+        }
+        Command::PublishDns {
+            domains,
+            node_label_selector,
+        } => {
+            run_dns_publisher(&domains, node_label_selector.as_deref()).await?;
         }
     }
 
@@ -251,5 +266,278 @@ async fn update_nodes_repeatedly(every: std::time::Duration) -> miette::Result<(
                 // Ready to update IPs again
             }
         }
+    }
+}
+
+async fn run_dns_publisher(domains: &[String], node_selector: Option<&str>) -> miette::Result<()> {
+    let aws_config = aws_config::load_from_env().await;
+    let route53 = aws_sdk_route53::Client::new(&aws_config);
+
+    let mut public_hosted_zones = vec![];
+    let mut hosted_zone_stream = route53.list_hosted_zones().into_paginator().send();
+    while let Some(hosted_zones_page) = hosted_zone_stream.next().await {
+        let hosted_zones_page = hosted_zones_page.into_diagnostic()?;
+        public_hosted_zones.extend(hosted_zones_page.hosted_zones.into_iter().filter(
+            |hosted_zone| {
+                hosted_zone
+                    .config
+                    .as_ref()
+                    .is_none_or(|config| !config.private_zone)
+            },
+        ));
+    }
+
+    let domains = domains
+        .iter()
+        .map(|domain| find_hosted_zone_for_domain(&public_hosted_zones, domain))
+        .collect::<miette::Result<Vec<_>>>()?;
+
+    let kube = kube::Client::try_default()
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to build Kubernetes client")?;
+    let nodes = kube::Api::<Node>::all(kube);
+
+    let mut state = DnsPublisher {
+        domains,
+        nodes: HashMap::new(),
+    };
+
+    let mut node_watch_config = kube::runtime::watcher::Config::default();
+    if let Some(node_selector) = node_selector {
+        node_watch_config = node_watch_config.labels(node_selector);
+    }
+
+    let node_stream = kube::runtime::watcher(nodes, node_watch_config);
+    let mut node_stream = std::pin::pin!(node_stream);
+    while let Some(event) = node_stream.next().await {
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::error!("error in node watch stream: {error:?}");
+                continue;
+            }
+        };
+
+        let result = state.handle_event(&event);
+        let did_change = match result {
+            Ok(did_change) => did_change,
+            Err(error) => {
+                tracing::error!("error when handling node event: {error:?}");
+                continue;
+            }
+        };
+
+        let is_current = match event {
+            kube::runtime::watcher::Event::Apply(_) | kube::runtime::watcher::Event::Delete(_) => {
+                true
+            }
+            kube::runtime::watcher::Event::Init
+            | kube::runtime::watcher::Event::InitApply(_)
+            | kube::runtime::watcher::Event::InitDone => false,
+        };
+        let should_publish = is_current && did_change;
+
+        if should_publish {
+            tracing::info!("(todo) publish DNS for nodes: {:?}", state.nodes);
+        }
+    }
+
+    tracing::info!("watch stream ended");
+
+    Ok(())
+}
+
+struct DnsPublisher {
+    nodes: HashMap<String, NodeState>,
+    domains: Vec<HostedZoneDomain>,
+}
+
+impl DnsPublisher {
+    fn handle_event(
+        &mut self,
+        event: &kube::runtime::watcher::Event<Node>,
+    ) -> miette::Result<bool> {
+        match event {
+            kube::runtime::watcher::Event::Apply(node)
+            | kube::runtime::watcher::Event::InitApply(node) => {
+                let name = node
+                    .metadata
+                    .name
+                    .as_ref()
+                    .wrap_err("received 'apply' node event without a name")?;
+
+                let node_state = NodeState::from_node(node)?;
+
+                match self.nodes.entry(name.clone()) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        if let Some(node_state) = node_state {
+                            if *entry.get() == node_state {
+                                tracing::debug!(
+                                    node = name,
+                                    "skipping node update event, node state did not change"
+                                );
+                                Ok(false)
+                            } else {
+                                tracing::debug!(node = name, "inserted updated node state");
+                                entry.insert(node_state);
+                                Ok(true)
+                            }
+                        } else {
+                            tracing::debug!(
+                                node = name,
+                                "removing node state, new node state is None"
+                            );
+                            entry.remove();
+                            Ok(true)
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        if let Some(node_state) = node_state {
+                            tracing::debug!(node = name, "inserted new node state");
+                            entry.insert(node_state);
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
+                    }
+                }
+            }
+            kube::runtime::watcher::Event::Delete(node) => {
+                let name = node
+                    .metadata
+                    .name
+                    .clone()
+                    .wrap_err("received 'delete' node event without a name")?;
+                let removed = self.nodes.remove(&name);
+                if removed.is_some() {
+                    tracing::debug!(node = name, "removing node state, node deleted");
+                }
+                Ok(removed.is_some())
+            }
+            kube::runtime::watcher::Event::Init | kube::runtime::watcher::Event::InitDone => {
+                // No op
+                Ok(false)
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct NodeState {
+    name: String,
+    ips: Vec<std::net::IpAddr>,
+    coordinates: Option<Coordinates>,
+}
+
+impl NodeState {
+    fn from_node(node: &Node) -> miette::Result<Option<Self>> {
+        let Some(name) = &node.metadata.name else {
+            return Ok(None);
+        };
+
+        let ips = node
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get("external-dns.alpha.kubernetes.io/target"));
+        let Some(ips) = ips else {
+            return Ok(None);
+        };
+        let ips = ips
+            .split(',')
+            .map(|ip| {
+                ip.parse()
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("invalid IP for node {name}: {ip}"))
+            })
+            .collect::<miette::Result<Vec<std::net::IpAddr>>>()?;
+
+        let coordinates: Option<Coordinates> = node
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| {
+                annotations.get("external-dns.alpha.kubernetes.io/aws-geoproximity-coordinates")
+            })
+            .map(|coordinates| coordinates.parse())
+            .transpose()?;
+
+        Ok(Some(Self {
+            name: name.clone(),
+            ips,
+            coordinates,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Coordinates {
+    latitude: f32,
+    longitude: f32,
+}
+
+impl std::str::FromStr for Coordinates {
+    type Err = miette::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.split_once(',')
+            .and_then(|(lat, lon)| {
+                let latitude: f32 = lat.parse().ok()?;
+                let longitude: f32 = lon.parse().ok()?;
+                Some(Self {
+                    latitude,
+                    longitude,
+                })
+            })
+            .wrap_err_with(|| {
+                format!(
+                    "invalid coordinates: expected string of the format '<lat>,<lon>', got: {s:?}"
+                )
+            })
+    }
+}
+
+struct HostedZoneDomain {
+    domain: String,
+    hosted_zone: aws_sdk_route53::types::HostedZone,
+    record_name: String,
+}
+
+fn find_hosted_zone_for_domain(
+    hosted_zones: &[aws_sdk_route53::types::HostedZone],
+    domain: &str,
+) -> miette::Result<HostedZoneDomain> {
+    let hosted_zone_domains = hosted_zones.iter().filter_map(|hosted_zone| {
+        let hosted_zone_domain = remove_fqdn_trailing_dot(&hosted_zone.name);
+        if hosted_zone_domain == domain {
+            Some(HostedZoneDomain {
+                domain: domain.to_string(),
+                hosted_zone: hosted_zone.clone(),
+                record_name: "@".to_string(),
+            })
+        } else if let Some((rest, "")) = domain.rsplit_once(&hosted_zone_domain)
+            && let Some((record_name, "")) = rest.rsplit_once('.')
+        {
+            Some(HostedZoneDomain {
+                domain: domain.to_string(),
+                hosted_zone: hosted_zone.clone(),
+                record_name: record_name.to_string(),
+            })
+        } else {
+            None
+        }
+    });
+
+    let hosted_zone_domain = hosted_zone_domains
+        .max_by_key(|hosted_zone_domain| hosted_zone_domain.hosted_zone.name.len())
+        .wrap_err_with(|| format!("no hosted zone found for domain: {domain}"))?;
+    Ok(hosted_zone_domain)
+}
+
+fn remove_fqdn_trailing_dot(domain: &str) -> &str {
+    match domain.rsplit_once('.') {
+        Some((domain, "")) => domain,
+        _ => domain,
     }
 }
