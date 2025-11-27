@@ -367,7 +367,7 @@ async fn run_dns_publisher(domains: &[String], node_selector: Option<&str>) -> m
 }
 
 struct DnsPublisher {
-    nodes: HashMap<String, NodeState>,
+    nodes: HashMap<String, NodePublishState>,
     domains: Vec<HostedZoneDomain>,
 }
 
@@ -386,6 +386,13 @@ impl DnsPublisher {
                     .wrap_err("received 'apply' node event without a name")?;
 
                 let node_state = NodeState::from_node(node)?;
+                let node_state = match node_state {
+                    NodeState::Publish(node_state) => Some(node_state),
+                    NodeState::NoIps => {
+                        tracing::debug!(node = name, "node does not have annotation with IPs");
+                        None
+                    }
+                };
 
                 match self.nodes.entry(name.clone()) {
                     std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -441,18 +448,18 @@ impl DnsPublisher {
     }
 }
 
-#[derive(Debug, PartialEq)]
-struct NodeState {
-    name: String,
-    ips: Vec<std::net::IpAddr>,
-    coordinates: Option<Coordinates>,
+enum NodeState {
+    Publish(NodePublishState),
+    NoIps,
 }
 
 impl NodeState {
-    fn from_node(node: &Node) -> miette::Result<Option<Self>> {
-        let Some(name) = &node.metadata.name else {
-            return Ok(None);
-        };
+    fn from_node(node: &Node) -> miette::Result<Self> {
+        let name = node
+            .metadata
+            .name
+            .as_ref()
+            .wrap_err("node metadata is missing 'name' field")?;
 
         let ips = node
             .metadata
@@ -460,7 +467,7 @@ impl NodeState {
             .as_ref()
             .and_then(|annotations| annotations.get("external-dns.alpha.kubernetes.io/target"));
         let Some(ips) = ips else {
-            return Ok(None);
+            return Ok(Self::NoIps);
         };
         let ips = ips
             .split(',')
@@ -481,12 +488,19 @@ impl NodeState {
             .map(|coordinates| coordinates.parse())
             .transpose()?;
 
-        Ok(Some(Self {
+        Ok(Self::Publish(NodePublishState {
             name: name.clone(),
             ips,
             coordinates,
         }))
     }
+}
+
+#[derive(Debug, PartialEq)]
+struct NodePublishState {
+    name: String,
+    ips: Vec<std::net::IpAddr>,
+    coordinates: Option<Coordinates>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
