@@ -5,28 +5,62 @@ on:
     branches: [main]
 
 jobs:
+  build-oci-image:
+    strategy:
+      matrix:
+        include:
+          - runs-on: ubuntu-24.04
+            os: linux
+            arch: amd64
+          - runs-on: ubuntu-24.04-arm
+            os: linux
+            arch: arm64
+    name: Build [${{ matrix.arch }}-${{ matrix.os }}]
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Install Brioche
+        uses: brioche-dev/setup-brioche@v1
+      - name: Build
+        run: brioche build -e containerRoot -o "kube-node-dns-$arch-$os"
+        env:
+          arch: ${{ matrix.arch }}
+          os: ${{ matrix.os }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: "kube-node-dns-${{ matrix.arch }}-${{ matrix.os }}"
+          path: "kube-node-dns-${{ matrix.arch }}-${{ matrix.os }}"
+
   publish-oci-image:
     name: Publish OCI image
-    runs-on: ubuntu-latest
+    needs: [build-oci-image]
+    runs-on: ubuntu-24.04
     permissions:
       packages: write
       contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
-      - name: Install Brioche
-        uses: brioche-dev/setup-brioche@v1
-      - name: Build container
-        run: brioche build -e container -o kube-node-dns.tar
+      - name: Download artifacts
+        uses: actions/download-artifact@v6
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publish container
-        run: |
-          image_tag="ghcr.io/kylewlacy/kube-node-dns:latest"
-          image_id="$(docker image load -i kube-node-dns.tar | grep -Eo 'sha256:[0-9a-fA-F]{64}$')"
-          docker tag "$image_id" "$image_tag"
-          docker push "$image_tag"
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          file: combined.dockerfile
+          tags: ghcr.io/kylewlacy/kube-node-dns:latest
+          context: .
+          push: true
+          platforms: "linux/amd64,linux/arm64"
+

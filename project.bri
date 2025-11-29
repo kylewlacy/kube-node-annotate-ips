@@ -8,7 +8,4 @@ export default function kubeNodeDns(): std.Recipe<std.Directory> {
   });
 }
 
-export const container = std.ociContainerImage({
-  recipe: std.merge(kubeNodeDns, caCertificates),
-  entrypoint: ["bin/kube-node-dns"],
-});
+export const containerRoot = std.merge(kubeNodeDns, caCertificates);
